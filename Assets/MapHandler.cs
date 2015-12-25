@@ -83,6 +83,9 @@ public class MapHandler : MonoBehaviour
     private const float Lat = 47.9874f;
     private const float Long = 7.8945f;
 
+    private const float MovSpeed = 0.8f;
+    private const float Damping = 0.92f;
+
     private volatile MapTile[] _mapTiles;
     private volatile List<MapTile> _tileCache; 
     private int _activeThreads;
@@ -92,6 +95,7 @@ public class MapHandler : MonoBehaviour
 
     private Vector2 _targetTile;
     private Vector3 _mousePos;
+    private Vector2 _mouseVel;
 
     public Vector2 WorldToTilePos(double lat, double lon, int zoom)
     {
@@ -117,6 +121,8 @@ public class MapHandler : MonoBehaviour
 
         var targetVec = new Vector2(Lat, Long);
         _targetTile = WorldToTilePos(targetVec.x, targetVec.y, Zoom);
+
+        _mouseVel = new Vector2(0, 0);
 
         _activeThreads = 1;
         new Thread(() => LoadMap((int) _targetTile.x, (int) _targetTile.y, Zoom)).Start();
@@ -207,19 +213,30 @@ public class MapHandler : MonoBehaviour
         if (Input.GetMouseButton(0))
         {
             var mouseDiff = Input.mousePosition - _mousePos;
-            var newX = _targetTile.x - mouseDiff.x/256.0f;
-            var newY = _targetTile.y + mouseDiff.y/256.0f;
 
-            var diffX = (int) newX - (int) _targetTile.x;
-            var diffY = (int) newY - (int) _targetTile.y;
-
-            if (diffX != 0 || diffY != 0)
-                LoadMap((int) newX, (int) newY, Zoom);
-
-             _targetTile.x = newX;
-             _targetTile.y = newY;
+            _mouseVel.x = MovSpeed * mouseDiff.x;
+            _mouseVel.y = MovSpeed * mouseDiff.y;
 
             _mousePos = Input.mousePosition;
         }
+        else
+        {
+            var curDamp = (float)Math.Exp(-Damping * Time.deltaTime);
+
+            _mouseVel.x *= curDamp;
+            _mouseVel.y *= curDamp;
+        }
+
+        var newX = _targetTile.x - _mouseVel.x/256.0f;
+        var newY = _targetTile.y + _mouseVel.y/256.0f;
+
+        var diffX = (int) newX - (int) _targetTile.x;
+        var diffY = (int) newY - (int) _targetTile.y;
+
+        if (diffX != 0 || diffY != 0)
+            LoadMap((int) newX, (int) newY, Zoom);
+
+        _targetTile.x = newX;
+        _targetTile.y = newY;
     }
 }
