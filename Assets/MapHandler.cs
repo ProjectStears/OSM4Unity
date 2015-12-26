@@ -7,42 +7,51 @@ using System.Threading;
 
 public class MapTile
 {
-    public readonly int X;
-    public readonly int Y;
-    public readonly int Zoom;
+    internal readonly int X;
+    internal readonly int Y;
+    internal readonly int Zoom;
 
-    public readonly byte[] Data;
+    internal Texture2D Tex;
+    internal volatile byte[] Data;
+    internal volatile bool ToBeRendered;
 
-    public Texture2D Tex { private set; get; }
-
-    internal MapTile()
-    {
-        X = Y = Zoom = -1;
-
-        Tex = new Texture2D(1, 1, TextureFormat.RGB24, false);
-        Tex.SetPixel(0, 0, new Color(252, 251, 231));
-        Tex.Apply();
-    }
-
-    internal MapTile(int x, int y, int zoom, byte[] data)
+    internal MapTile(int x, int y, int zoom)
     {
         X = x;
         Y = y;
         Zoom = zoom;
-        Data = data;
+
+        // loading texture
+        Tex = new Texture2D(1, 1, TextureFormat.RGB24, false);
+        Tex.SetPixel(0, 0, new Color(252, 251, 231));
+        Tex.Apply();
+
+        ToBeRendered = false;
     }
 
-    internal void RenderTileTex()
+    internal void SetData(byte[] data)
+    {
+        Data = data;
+        ToBeRendered = true;
+    }
+
+    internal void RenderData()
     {
         Tex = new Texture2D(256, 256, TextureFormat.RGB24, false);
         Tex.LoadImage(Data);
+        ToBeRendered = false;
     }
 
-    public override bool Equals(object other)
+    public override bool Equals(object obj)
     {
-        var tile = other as MapTile;
+        var tile = obj as MapTile;
         if (tile == null) return false;
-        return (X == tile.X) && (Y == tile.Y) && (Zoom == tile.Zoom);
+        return tile.X == X && tile.Y == Y && tile.Zoom == Zoom;
+    }
+
+    protected bool Equals(MapTile other)
+    {
+        return X == other.X && Y == other.Y && Zoom == other.Zoom;
     }
 
     public bool Equals(int x, int y, int zoom)
@@ -55,8 +64,8 @@ public class MapTile
         unchecked
         {
             var hashCode = X;
-            hashCode = (hashCode * 397) ^ Y;
-            hashCode = (hashCode * 397) ^ Zoom;
+            hashCode = (hashCode*397) ^ Y;
+            hashCode = (hashCode*397) ^ Zoom;
             return hashCode;
         }
     }
@@ -77,7 +86,7 @@ public static class Extensions
 
 public class MapHandler : MonoBehaviour
 {
-    private const int MaxThreads = 50;
+    private const int MaxThreads = 25;
 
     private const int Zoom = 16;
     private const float Lat = 47.9874f;
@@ -87,11 +96,16 @@ public class MapHandler : MonoBehaviour
     private const float Damping = 0.92f;
 
     private volatile MapTile[] _mapTiles;
-    private volatile List<MapTile> _tileCache; 
+    private volatile List<MapTile> _tileCache;
+
     private int _activeThreads;
+    private volatile bool _dlHandlerActive;
+    private volatile List<MapTile> _downloadList;
 
     private int _noXTiles;
     private int _noYTiles;
+
+    private int test = 0;
 
     private Vector2 _targetTile;
     private Vector3 _mousePos;
@@ -114,18 +128,19 @@ public class MapHandler : MonoBehaviour
         _noYTiles = (int) Math.Ceiling(Screen.height/256f);
         _noYTiles = _noYTiles + (_noYTiles - 1)%2 + 2;
 
-        var dummyTile = new MapTile();
-
-        _tileCache = new List<MapTile> {dummyTile};
-        _mapTiles = Enumerable.Repeat(dummyTile, _noXTiles*_noYTiles).ToArray();
+        _tileCache = new List<MapTile>();
+        _mapTiles = new MapTile[_noXTiles*_noYTiles];
 
         var targetVec = new Vector2(Lat, Long);
         _targetTile = WorldToTilePos(targetVec.x, targetVec.y, Zoom);
 
         _mouseVel = new Vector2(0, 0);
 
-        _activeThreads = 1;
-        new Thread(() => LoadMap((int) _targetTile.x, (int) _targetTile.y, Zoom)).Start();
+        _dlHandlerActive = false;
+        _activeThreads = 0;
+        _downloadList = new List<MapTile>();
+
+        LoadMap((int) _targetTile.x, (int) _targetTile.y, Zoom);
     }
 
     private void LoadMap(int targX, int targY, int zoom)
@@ -145,37 +160,70 @@ public class MapHandler : MonoBehaviour
                     _mapTiles[id] = _tileCache.GetTile(x, y, zoom);
                 else
                 {
-                    var cx = x;
-                    var cy = y;
+                    var tile = new MapTile(x, y, Zoom);
+                    _mapTiles[id] = tile;
 
-                    _mapTiles[id] = _tileCache.GetTile(-1, -1, -1);
-                    new Thread(() => DownloadData(id, zoom, cx, cy)).Start();
-
-                    Interlocked.Increment(ref _activeThreads);
-                    while (_activeThreads > MaxThreads)
-                        Thread.Sleep(1);
+                    _tileCache.Add(tile);
+                    _downloadList.Insert(0, tile);
                 }
 
                 tileID++;
             }
         }
 
-        Interlocked.Decrement(ref _activeThreads);
-    }
-
-    private void DownloadData(int id, int zoom, int x, int y)
-    {
-        var url = "http://141.28.104.22/osm/" + zoom + "/" + x + "/" + y + ".png";
-        
-        using (var webClient = new WebClient())
+        // delete fly-over tiles
+        while (_downloadList.Count > _noXTiles*_noYTiles)
         {
-            var data = webClient.DownloadData(url);
-            var tile = new MapTile(x, y, Zoom, data);
-
-            _mapTiles[id] = tile;
-            _tileCache.Add(tile);
+            var lastTile = _downloadList[_downloadList.Count - 1];
+            _tileCache.Remove(lastTile);
+            _downloadList.Remove(lastTile);
         }
 
+        if (_dlHandlerActive) return;
+        new Thread(DownloadHandler).Start();
+        _dlHandlerActive = true;
+    }
+    
+    private void DownloadHandler()
+    {
+        while (_downloadList.Count > 0)
+        {
+            while (_activeThreads >= MaxThreads)
+                Thread.Sleep(1);
+
+            lock (_downloadList)
+            {
+                var firstTile = _downloadList[0];
+                _downloadList.RemoveAt(0);
+
+                new Thread(() => DownloadData(firstTile)).Start();
+            }
+
+            Interlocked.Increment(ref _activeThreads);
+        }
+
+        _dlHandlerActive = false;
+    }
+
+    private void DownloadData(MapTile tile)
+    {
+        var url = "http://141.28.104.22/osm/" + tile.Zoom + "/" + tile.X + "/" + tile.Y + ".png";
+
+        using (var webClient = new WebClient())
+        {
+            test++;
+            Debug.Log("Starting Download (" + _activeThreads + ", " + test + ")");
+            //var data = 
+            webClient.DownloadDataCompleted +=  delegate(object sender, DownloadDataCompletedEventArgs e)   
+                      {   
+                        tile.SetData(e.Result);  
+                      };  
+            webClient.DownloadDataAsync(new Uri(url));
+            
+            while (webClient.IsBusy) {Thread.Sleep(10);}
+            Debug.Log("Download done (" + _activeThreads + ")");
+            //tile.SetData(data);
+        }
         Interlocked.Decrement(ref _activeThreads);
     }
 
@@ -184,7 +232,7 @@ public class MapHandler : MonoBehaviour
         var centerX = _noXTiles*256/2.0f - Screen.width/2.0f;
         var centerY = _noYTiles*256/2.0f - Screen.height/2.0f;
 
-        var mapDiff = 256 * new Vector2(0.5f - (_targetTile.x - (int) _targetTile.x),
+        var mapDiff = 256*new Vector2(0.5f - (_targetTile.x - (int) _targetTile.x),
             0.5f - (_targetTile.y - (int) _targetTile.y));
 
         for (var x = 0; x < _noXTiles; x++)
@@ -192,12 +240,13 @@ public class MapHandler : MonoBehaviour
             for (var y = 0; y < _noYTiles; y++)
             {
                 var id = x*_noYTiles + y;
-
                 var tile = _mapTiles[id];
-                if (tile == null) continue;
 
-                if (tile.Tex == null)
-                    tile.RenderTileTex();
+                if (tile == null)
+                    continue;
+
+                if (tile.ToBeRendered)
+                    tile.RenderData();
 
                 GUI.DrawTexture(new Rect(x*256 - centerX + mapDiff.x,
                     y*256 - centerY + mapDiff.y, 256, 256), tile.Tex);
