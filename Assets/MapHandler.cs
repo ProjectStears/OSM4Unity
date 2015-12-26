@@ -1,12 +1,54 @@
 ﻿using System;
 using UnityEngine;
 using System.Collections.Generic;
-using System.Linq;
+using System.Diagnostics;
+using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Threading;
+using Debug = UnityEngine.Debug;
+
+public delegate void TileLoadingCallback(MapTile tile, bool error);
+
+public static class Extensions
+{
+    public static bool TileExists(this List<MapTile> list, int x, int y, int zoom)
+    {
+        return list.Exists(item => item.X == x && item.Y == y && item.Zoom == zoom);
+    }
+
+    public static MapTile GetTile(this List<MapTile> list, int x, int y, int zoom)
+    {
+        return list.Find(item => item.X == x && item.Y == y && item.Zoom == zoom);
+    }
+
+    public static byte[] ToArray(this Stream stream, long length)
+    {
+        var buffer = new byte[length];    
+
+        using (var ms = new MemoryStream())
+        {
+            int read;
+
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                ms.Write(buffer, 0, read);
+            
+            return ms.ToArray();
+        }
+    }
+}
 
 public class MapTile
 {
+    public enum TileState
+    {
+        Loading,
+        Abort,
+        Done
+    }
+
+    private const string TileSrv = "http://141.28.104.22/osm/";
+
     internal readonly int X;
     internal readonly int Y;
     internal readonly int Zoom;
@@ -15,18 +57,123 @@ public class MapTile
     internal volatile byte[] Data;
     internal volatile bool ToBeRendered;
 
+    private volatile string _eTag;
+    private volatile TileState _tileState;
+    private volatile HttpWebRequest _webRq;
+    private volatile int _dlRetry;
+
     internal MapTile(int x, int y, int zoom)
     {
         X = x;
         Y = y;
         Zoom = zoom;
 
-        // loading texture
+        // dummy texture
         Tex = new Texture2D(1, 1, TextureFormat.RGB24, false);
         Tex.SetPixel(0, 0, new Color(252, 251, 231));
         Tex.Apply();
 
         ToBeRendered = false;
+
+        _tileState = TileState.Loading;
+    }
+
+    private void LoadCachedTile(string name)
+    {
+        // load from hard drive
+        using (var fileStream = new FileStream("cache/" + name, FileMode.Open))
+        {
+            Data = fileStream.ToArray(fileStream.Length);
+
+            var md5Hash = new MD5CryptoServiceProvider().ComputeHash(Data);
+
+            _eTag = BitConverter.ToString(md5Hash);
+            _eTag = _eTag.Replace("-", string.Empty).ToLower();
+        }
+    }
+
+    internal void LoadTile(int limit, TileLoadingCallback cb)
+    {
+        var url = TileSrv + Zoom + "/" + X + "/" + Y + ".png";
+        var filename = X + "-" + Y + "-" + Zoom + ".png";
+
+        if (File.Exists("cache/" + filename))
+            LoadCachedTile(filename);
+
+        _webRq = (HttpWebRequest) WebRequest.Create(url);
+
+        _webRq.AllowAutoRedirect = false;
+        _webRq.KeepAlive = false;
+        _webRq.Proxy = null;
+        _webRq.Timeout = 5000;
+
+        _webRq.ServicePoint.Expect100Continue = false;
+        _webRq.ServicePoint.ConnectionLimit = limit;
+
+        if (!string.IsNullOrEmpty(_eTag))
+        {
+            _webRq.Headers["CacheControl"] = "max-age=0";
+            _webRq.Headers["If-None-Match"] = "\"" + _eTag + "\"";
+        }
+
+        _dlRetry = 0;
+        HttpWebResponse webRsp = null;
+
+        while (_tileState != TileState.Abort && _tileState != TileState.Done && _dlRetry < 3)
+        {
+            try
+            {
+                webRsp = (HttpWebResponse) _webRq.GetResponse();
+
+                if (webRsp.StatusCode == HttpStatusCode.NotModified)
+                {
+                    SetData(Data);
+                    _tileState = TileState.Done;
+                }
+                   
+                if (webRsp.StatusCode == HttpStatusCode.OK)
+                {
+                    var dataStream = webRsp.GetResponseStream();
+                 
+                    if (dataStream != null)
+                    {
+                        SetData(dataStream.ToArray(webRsp.ContentLength));
+                     
+                        using (var fileStream = new FileStream("cache/" + filename, FileMode.Create))
+                            fileStream.Write(Data, 0, Data.Length);
+
+                        _eTag = webRsp.Headers["ETag"].Replace("\"", string.Empty);
+                        _tileState = TileState.Done;
+
+                        dataStream.Close();
+                    }
+                }
+
+                webRsp.Close();
+
+                if (_tileState != TileState.Done)
+                    _dlRetry++;
+
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("Tile " + X + "/" + Y + ": " + ex);
+
+                _dlRetry++;
+
+                if (webRsp != null)
+                    webRsp.Close();
+            }
+        }
+ 
+        cb(this, _tileState != TileState.Done);
+    }
+
+    internal void AbortDownload()
+    {
+        if (_webRq == null) return;
+        _tileState = TileState.Abort;
+        _webRq.Abort();
     }
 
     internal void SetData(byte[] data)
@@ -71,22 +218,9 @@ public class MapTile
     }
 }
 
-public static class Extensions
-{
-    public static bool TileExists(this List<MapTile> list, int x, int y, int zoom)
-    {
-        return list.Exists(item => item.X == x && item.Y == y && item.Zoom == zoom);
-    }
-
-    public static MapTile GetTile(this List<MapTile> list, int x, int y, int zoom)
-    {
-        return list.Find(item => item.X == x && item.Y == y && item.Zoom == zoom);
-    }
-}
-
 public class MapHandler : MonoBehaviour
 {
-    private const int MaxThreads = 25;
+    private const int MaxThreads = 50;
 
     private const int Zoom = 16;
     private const float Lat = 47.9874f;
@@ -104,8 +238,6 @@ public class MapHandler : MonoBehaviour
 
     private int _noXTiles;
     private int _noYTiles;
-
-    private int test = 0;
 
     private Vector2 _targetTile;
     private Vector3 _mousePos;
@@ -139,6 +271,9 @@ public class MapHandler : MonoBehaviour
         _dlHandlerActive = false;
         _activeThreads = 0;
         _downloadList = new List<MapTile>();
+
+        if (!Directory.Exists("cache"))
+            Directory.CreateDirectory("cache");
 
         LoadMap((int) _targetTile.x, (int) _targetTile.y, Zoom);
     }
@@ -175,13 +310,16 @@ public class MapHandler : MonoBehaviour
         while (_downloadList.Count > _noXTiles*_noYTiles)
         {
             var lastTile = _downloadList[_downloadList.Count - 1];
+            lastTile.AbortDownload();
+
             _tileCache.Remove(lastTile);
             _downloadList.Remove(lastTile);
         }
-
+        
         if (_dlHandlerActive) return;
         new Thread(DownloadHandler).Start();
         _dlHandlerActive = true;
+
     }
     
     private void DownloadHandler()
@@ -190,41 +328,25 @@ public class MapHandler : MonoBehaviour
         {
             while (_activeThreads >= MaxThreads)
                 Thread.Sleep(1);
-
+            
             lock (_downloadList)
             {
                 var firstTile = _downloadList[0];
                 _downloadList.RemoveAt(0);
 
-                new Thread(() => DownloadData(firstTile)).Start();
+                new Thread(() => firstTile.LoadTile(MaxThreads, TileDLCallback)).Start();
             }
-
+           
             Interlocked.Increment(ref _activeThreads);
         }
 
         _dlHandlerActive = false;
     }
 
-    private void DownloadData(MapTile tile)
+    private void TileDLCallback(MapTile tile, bool error)
     {
-        var url = "http://141.28.104.22/osm/" + tile.Zoom + "/" + tile.X + "/" + tile.Y + ".png";
-
-        using (var webClient = new WebClient())
-        {
-            test++;
-            Debug.Log("Starting Download (" + _activeThreads + ", " + test + ")");
-            //var data = 
-            webClient.DownloadDataCompleted +=  delegate(object sender, DownloadDataCompletedEventArgs e)   
-                      {   
-                        tile.SetData(e.Result);  
-                      };  
-            webClient.DownloadDataAsync(new Uri(url));
-            
-            while (webClient.IsBusy) {Thread.Sleep(10);}
-            Debug.Log("Download done (" + _activeThreads + ")");
-            //tile.SetData(data);
-        }
         Interlocked.Decrement(ref _activeThreads);
+        if (error) _tileCache.Remove(tile);
     }
 
     private void OnGUI()
